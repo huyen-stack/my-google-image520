@@ -1,41 +1,56 @@
 import streamlit as st
 import google.generativeai as genai
 from PIL import Image
+from datetime import datetime
+import json
+from typing import Dict, Any, List
 
 # ========================
 # 基本配置
 # ========================
 
-APP_TITLE = "TapNow 风格 · 图生文 / 剧本拆分镜头 / 角色设定集"
+APP_TITLE = "TapNow 风格 · 图生文 / 剧本拆镜头 / 角色设定集 + 历史记录"
 GEMINI_MODEL_NAME = "gemini-flash-latest"
 
+st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
+
+# 初始化 session_state
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
+if "history" not in st.session_state:
+    # 每项结构：
+    # {
+    #   "id": int,
+    #   "type": "image_style" | "image_shot" | "image_prompt" | "script_scene" | "role_design",
+    #   "title": str,
+    #   "timestamp": str,
+    #   "input": dict or str,
+    #   "content": str  # Markdown / 文本
+    # }
+    st.session_state["history"] = []
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
+
+# ========================
+# 全局样式：白底 + 卡片
+# ========================
 
 st.markdown(
     """
     <style>
-    .main {
-        background-color: #020617;
-        color: #e5e7eb;
-    }
-    .stMarkdown, .stText {
-        color: #e5e7eb;
-    }
-    .stCode {
-        font-size: 0.9rem !important;
+    .stApp {
+        background-color: #f5f5f5;
+        color: #111827;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     .block-card {
-        border-radius: 16px;
-        padding: 16px 18px;
+        background-color: #ffffff;
+        border-radius: 12px;
+        padding: 16px 20px;
         margin-bottom: 16px;
-        background: #020617;
-        border: 1px solid rgba(148, 163, 184, 0.4);
+        border: 1px solid #e5e7eb;
     }
     .block-title {
-        font-size: 1.05rem;
+        font-size: 1rem;
         font-weight: 600;
         margin-bottom: 8px;
     }
@@ -48,18 +63,16 @@ st.markdown(
     f"""
     <div style="
         padding: 18px 24px;
-        border-radius: 18px;
+        border-radius: 16px;
         margin-bottom: 16px;
-        background: radial-gradient(circle at top left, #22c55e 0, #020617 55%, #020617 100%);
-        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: linear-gradient(135deg, #22c55e, #0ea5e9);
+        color: #f9fafb;
     ">
-      <h1 style="margin: 0 0 8px 0; color: #e5e7eb; font-size: 1.6rem;">
+      <h1 style="margin: 0 0 6px 0; font-size: 1.6rem;">
         🎬 {APP_TITLE}
       </h1>
-      <p style="margin: 0; color: #cbd5f5; font-size: 0.96rem;">
-        这是一个类似 TapNow 的“文案/提示词工具”：
-        <b>图生文（图片反推提示词）</b>、<b>剧本拆镜头</b>、<b>角色设定集</b>，
-        所有结果都是<b>可复制的提示词</b>，不直接生成图片/视频，方便你后面接 SORA / VEO / Kling / Midjourney 等模型。
+      <p style="margin: 0; font-size: 0.96rem;">
+        一站式提示词工具：图生文（图片反推）、剧本拆分镜头、角色设定集，并自动记录所有历史结果，方便后期查看和复用。
       </p>
     </div>
     """,
@@ -92,17 +105,20 @@ with st.sidebar:
         model = None
         st.warning("🔴 请输入有效 API Key。")
 
-# 公共小工具：调用 Gemini
-def call_gemini_text(prompt_parts):
+
+# ========================
+# 公共小工具
+# ========================
+
+def call_gemini_text(prompt_parts) -> str | None:
+    """统一封装 Gemini 文本调用"""
     if not model:
         st.error("请先在左侧输入有效的 Google API Key。")
         return None
     try:
         resp = model.generate_content(prompt_parts)
-        # Gemini 通常用 resp.text 即可
         txt = getattr(resp, "text", None)
         if not txt:
-            # fallback
             txt = str(resp)
         return txt.strip()
     except Exception as e:
@@ -110,15 +126,35 @@ def call_gemini_text(prompt_parts):
         return None
 
 
+def add_history(item_type: str, title: str, input_data: Any, content: str):
+    """把一次生成结果加入历史记录"""
+    history: List[Dict[str, Any]] = st.session_state["history"]
+    item_id = len(history) + 1
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    history.append(
+        {
+            "id": item_id,
+            "type": item_type,
+            "title": title,
+            "timestamp": ts,
+            "input": input_data,
+            "content": content,
+        }
+    )
+    st.session_state["history"] = history
+
+
 # ========================
 # Tab 布局
 # ========================
 
-tab1, tab2, tab3 = st.tabs(["🖼 图生文（图片反推）", "📚 剧本拆分镜头", "👤 角色设定集"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["🖼 图生文（图片反推）", "📚 剧本拆分镜头", "👤 角色设定集", "📂 历史记录"]
+)
 
 
 # ========================
-# Tab1：图生文（图片反推）
+# Tab1：图生文
 # ========================
 
 with tab1:
@@ -127,31 +163,32 @@ with tab1:
     col_img, col_ctrl = st.columns([1, 1.4])
     with col_img:
         uploaded_image = st.file_uploader(
-            "上传参考图片（只分析，不生成）：",
+            "上传参考图片（只做分析和提示词，不直接生成图片）：",
             type=["jpg", "jpeg", "png", "webp"],
         )
         if uploaded_image:
             img = Image.open(uploaded_image).convert("RGB")
-            st.image(img, caption="已上传图片预览", use_column_width=True)
+            st.image(
+                img,
+                caption=f"已上传：{uploaded_image.name}",
+                width=420,
+            )
         else:
             img = None
 
     with col_ctrl:
         st.markdown(
             """
-            生成内容（可以单独点击按钮调用）：
-            
-            1️⃣ **风格提示词 (Style)**：分析画面的艺术/画风关键词。  
-            2️⃣ **镜头与景别 (Shot & Composition)**：分析构图、景别、机位、光影。  
-            3️⃣ **完整提示词 (Prompt)**：生成可直接丢给模型的完整描述（中文 + 英文）。  
+            **这三个功能是分开的，想用哪个就点哪个：**
+
+            1️⃣ **风格提示词 (Style)**：画风、质感、色彩氛围等关键词。  
+            2️⃣ **镜头与景别 (Shot & Composition)**：景别、机位、构图、光影。  
+            3️⃣ **完整提示词 (Prompt)**：中文描述 + 对应英文 Prompt，直接丢给模型用。  
             """
         )
-
         style_btn = st.button("🎨 生成风格提示词 (Style)")
         shot_btn = st.button("🎥 分析镜头与景别 (Shot & Composition)")
         prompt_btn = st.button("🧠 生成完整提示词 (Prompt)")
-
-    st.markdown("---")
 
     # --- 风格提示词 ---
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
@@ -166,7 +203,7 @@ with tab1:
 请用中文输出以下内容，格式用 Markdown：
 
 【风格总结】
-- 用 1～2 句话概括整张图的视觉风格，例如：Q版动漫、暖色系治愈风、赛博朋克写实、3D 卡通渲染、油画风格等。
+- 用 1～2 句话概括整张图的视觉风格，例如：Q版动漫、暖色治愈风、赛博朋克写实、3D 卡通渲染、写实人像等。
 
 【风格提示词（中文）】
 - 用逗号分隔的中文关键词，总结：画风、质感、色彩氛围、时代感，例如：
@@ -179,6 +216,12 @@ with tab1:
             text = call_gemini_text([prompt, img])
             if text:
                 st.markdown(text)
+                add_history(
+                    "image_style",
+                    f"风格提示词 - {uploaded_image.name if uploaded_image else ''}",
+                    {"filename": uploaded_image.name if uploaded_image else ""},
+                    text,
+                )
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -210,16 +253,20 @@ with tab1:
 - 光源方向（从左/右/上/后方）
 - 光线类型（直射光、散射光、逆光、轮廓光）
 - 氛围（温暖、冷峻、梦幻、压抑等）
-
-不用写英文，只要中文分析即可。
 """
             text = call_gemini_text([prompt, img])
             if text:
                 st.markdown(text)
+                add_history(
+                    "image_shot",
+                    f"镜头与景别 - {uploaded_image.name if uploaded_image else ''}",
+                    {"filename": uploaded_image.name if uploaded_image else ""},
+                    text,
+                )
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # --- 完整提示词 ---
+    # --- 完整 Prompt ---
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
     st.markdown('<div class="block-title">🧠 完整提示词 (Prompt)</div>', unsafe_allow_html=True)
 
@@ -247,12 +294,18 @@ text, logo, watermark, subtitle, low resolution, blurry, distorted hands, extra 
             text = call_gemini_text([prompt, img])
             if text:
                 st.markdown(text)
+                add_history(
+                    "image_prompt",
+                    f"完整提示词 - {uploaded_image.name if uploaded_image else ''}",
+                    {"filename": uploaded_image.name if uploaded_image else ""},
+                    text,
+                )
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ========================
-# Tab2：剧本拆分镜头
+# Tab2：剧本拆镜头
 # ========================
 
 with tab2:
@@ -260,18 +313,18 @@ with tab2:
 
     st.markdown(
         """
-        核心痛点解决：普通工具一段话只生成一张图，无法表达剧情情绪，缺乏影视感。  
-        这里可以：  
-        - 自动拆解剧本 → 主镜头（Keyframe）  
-        - 自动联想并生成补充镜头（Supplementary Shots：特写、中景、全景、环境空镜）  
-        - 输出一段「视频生成指令」，指导 SORA / VEO 等生成完整片段。
+**痛点解决：** 普通工具“一段话只出一张图”，剧情和情绪无法完整表达。  
+这里会自动拆解成：
+- 主镜头（Main Keyframe）  
+- 多个补充镜头（Supplementary Shots：特写 / 中景 / 全景 / 环境空镜）  
+- 一段「视频生成指令」描述镜头顺序和节奏。
         """
     )
 
     script_text = st.text_area(
-        "粘贴一小段剧情 / 文案（建议 1 个场景）：",
+        "粘贴一小段剧情 / 文案（建议只描述一个场景）：",
         height=200,
-        placeholder="例如：傍晚时分，林晓雨在旧木箱中发现了一只古老的铜哨……",
+        placeholder="示例：傍晚时分，林晓雨在旧木箱中发现了一只古老的铜哨......",
     )
     max_shots = st.slider(
         "希望拆成多少个补充镜头（不含主镜头）",
@@ -279,7 +332,7 @@ with tab2:
         max_value=6,
         value=4,
     )
-    scene_btn = st.button("🎬 开始拆分镜头", key="scene_btn")
+    scene_btn = st.button("🎬 开始拆分镜头")
 
     if scene_btn:
         if not script_text.strip():
@@ -327,6 +380,12 @@ with tab2:
                 st.markdown("---")
                 st.markdown("### 📖 拆分结果")
                 st.markdown(text)
+                add_history(
+                    "script_scene",
+                    "剧本拆分镜头",
+                    {"script": script_text, "max_shots": max_shots},
+                    text,
+                )
 
 
 # ========================
@@ -338,16 +397,8 @@ with tab3:
 
     st.markdown(
         """
-        核心痛点解决：AI 生成的视频中人物长相经常不一致，无法做连续剧。  
-        这个功能不炼模型，只生成<b>提示词版的“角色设定集”</b>，帮助你在不同场景、不同风格里保持同一角色的一致性。
-        
-        功能要点：
-        - 上传一张角色形象照片 / 立绘（脸部尽量清晰）；
-        - 选择一个主风格（古风、都市白领、修仙、校园校服等）；
-        - 输出：  
-          - 角色基础设定（人设 + 外貌 + 性格）；  
-          - 脸部三视图提示词（正脸、侧脸、背面/远景）；  
-          - 8 种不同风格的人物全景三视图 Prompt（方便你后面“换装”而不换脸）。
+**痛点解决：** AI 视频里人物长相经常变化，无法做连续剧情。  
+这里不炼模型，只生成<b>提示词版“角色设定集”</b>，帮助你在不同场景中保持同一个角色。
         """
     )
 
@@ -355,13 +406,13 @@ with tab3:
 
     with col_role_img:
         role_image = st.file_uploader(
-            "上传角色形象图片（只分析，不生成）：",
+            "上传角色形象图片（脸部尽量清晰）：",
             type=["jpg", "jpeg", "png", "webp"],
             key="role_img",
         )
         if role_image:
             role_img = Image.open(role_image).convert("RGB")
-            st.image(role_img, caption="角色图片预览", use_column_width=True)
+            st.image(role_img, caption=f"角色图片预览：{role_image.name}", width=380)
         else:
             role_img = None
 
@@ -406,7 +457,7 @@ with tab3:
 - 背面或远景（Back / Distant view）：中文简述 + 英文  
 
 ### 3. 8 种风格的人物全景三视图 Prompt（不换脸，只换穿搭和氛围）
-为保证角色可以“穿梭不同剧本场景”，请围绕同一张脸，设计 8 种不同服装/氛围的全身三视图 Prompt。
+围绕同一张脸，设计 8 种不同服装/氛围的全身三视图 Prompt。
 每种风格用小标题列出，格式示例：
 
 #### 风格A：古风侠客
@@ -426,3 +477,58 @@ with tab3:
                 st.markdown("---")
                 st.markdown("### 📚 角色设定集（可复制保存）")
                 st.markdown(text)
+                add_history(
+                    "role_design",
+                    f"角色设定集 - {role_image.name if role_image else ''}",
+                    {"filename": role_image.name if role_image else "", "main_style": main_style},
+                    text,
+                )
+
+
+# ========================
+# Tab4：历史记录
+# ========================
+
+with tab4:
+    st.subheader("📂 历史记录（本次会话自动保存）")
+
+    history: List[Dict[str, Any]] = st.session_state["history"]
+    if not history:
+        st.info("当前会话还没有任何历史记录。")
+    else:
+        type_map = {
+            "all": "全部类型",
+            "image_style": "图生文 · 风格提示词",
+            "image_shot": "图生文 · 镜头与景别",
+            "image_prompt": "图生文 · 完整提示词",
+            "script_scene": "剧本拆镜头",
+            "role_design": "角色设定集",
+        }
+        type_select = st.selectbox(
+            "按类型筛选：",
+            options=list(type_map.keys()),
+            format_func=lambda k: type_map[k],
+        )
+
+        # 逆序（最新在前）
+        for item in reversed(history):
+            if type_select != "all" and item["type"] != type_select:
+                continue
+
+            tag = type_map.get(item["type"], item["type"])
+            st.markdown(
+                f"#### 🧾 [{tag}] {item['title']}  \n"
+                f"`#{item['id']}` · {item['timestamp']}"
+            )
+
+            with st.expander("展开查看内容", expanded=False):
+                st.markdown(item["content"])
+                # 下载按钮
+                fname = f"history_{item['id']}_{item['type']}.md"
+                st.download_button(
+                    label="⬇️ 下载此记录（Markdown 文件）",
+                    data=item["content"],
+                    file_name=fname,
+                    mime="text/markdown",
+                )
+            st.markdown("---")
