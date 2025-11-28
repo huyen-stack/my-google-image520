@@ -1,29 +1,18 @@
 import streamlit as st
 import google.generativeai as genai
 from PIL import Image
-import json
-from datetime import datetime
-from typing import Dict, Any, List, Optional
 
 # ========================
 # 基本配置
 # ========================
 
-APP_TITLE = "图片 → 中文描述 + 英文提示词 生成助手"
-GEMINI_MODEL_NAME = "gemini-flash-latest"  # 你也可以改成 gemini-1.5-pro 等
-FREE_TIER_RPM_LIMIT = 10  # 免费典型：每分钟 10 次调用
+APP_TITLE = "TapNow 风格 · 图生文 / 剧本拆分镜头 / 角色设定集"
+GEMINI_MODEL_NAME = "gemini-flash-latest"
 
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
-if "last_result" not in st.session_state:
-    st.session_state["last_result"] = None
 
-
-# ========================
-# 页面样式 & 顶部介绍
-# ========================
-
-st.set_page_config(page_title=APP_TITLE, page_icon="🖼️", layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
 
 st.markdown(
     """
@@ -37,6 +26,18 @@ st.markdown(
     }
     .stCode {
         font-size: 0.9rem !important;
+    }
+    .block-card {
+        border-radius: 16px;
+        padding: 16px 18px;
+        margin-bottom: 16px;
+        background: #020617;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+    }
+    .block-title {
+        font-size: 1.05rem;
+        font-weight: 600;
+        margin-bottom: 8px;
     }
     </style>
     """,
@@ -53,279 +54,375 @@ st.markdown(
         border: 1px solid rgba(148, 163, 184, 0.35);
     ">
       <h1 style="margin: 0 0 8px 0; color: #e5e7eb; font-size: 1.6rem;">
-        🖼️ {APP_TITLE}
+        🎬 {APP_TITLE}
       </h1>
       <p style="margin: 0; color: #cbd5f5; font-size: 0.96rem;">
-        上传图片，让 Gemini 自动帮你生成一段<b>中文画面描述</b>（你看得懂）和一段<b>英文生成提示词</b>
-        （直接复制给 SORA / VEO / Kling / Midjourney / DALL·E 等模型使用）。
+        这是一个类似 TapNow 的“文案/提示词工具”：
+        <b>图生文（图片反推提示词）</b>、<b>剧本拆镜头</b>、<b>角色设定集</b>，
+        所有结果都是<b>可复制的提示词</b>，不直接生成图片/视频，方便你后面接 SORA / VEO / Kling / Midjourney 等模型。
       </p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-
 # ========================
-# 工具函数
-# ========================
-
-def _extract_text_from_response(resp) -> str:
-    """兼容不同 Gemini 返回结构，尽量拿到纯文本"""
-    text = getattr(resp, "text", None)
-    if text and isinstance(text, str) and text.strip():
-        return text.strip()
-
-    try:
-        texts = []
-        for cand in getattr(resp, "candidates", []) or []:
-            content = getattr(cand, "content", None)
-            if not content:
-                continue
-            for part in getattr(content, "parts", []) or []:
-                part_text = getattr(part, "text", None)
-                if part_text:
-                    texts.append(part_text)
-        if texts:
-            return " ".join(texts).strip()
-    except Exception:
-        pass
-
-    try:
-        return str(resp)
-    except Exception:
-        return ""
-
-
-def get_prompt_template() -> str:
-    """
-    返回：用于“生成中文描述 + 对应英文 Prompt”的系统指令。
-    """
-    return r"""
-你现在是一个顶级图片分析专家 + 提示词工程师。
-我会给你一张图片，你需要用中文 + 英文两种形式帮我描述这个画面，英文是给 AI 图生图 / 文生视频模型用的。
-
-【任务目标】
-1. 先用中文完整描述画面内容（人物长什么样、穿什么、在做什么、场景在哪里、光线/色彩/情绪是什么），
-   字数大约 3～6 句，尽量具体，但不要写成小说。
-2. 再写一段对应的英文生成提示词（Prompt），可以给 SORA / VEO / Kling / Midjourney / DALL·E 等模型使用：
-   - 用自然英文句子描述：主角、动作、场景、镜头视角（camera）、光线、色彩、风格（例如 cinematic, photorealistic, anime style 等）、画幅比例等；
-   - 不需要加太多“best quality, masterpiece, 8k” 这类老式咒语，更注重内容细节；
-   - 英文里不要出现中文；
-   - 结尾可以补充一小段参数描述，例如：cinematic lighting, highly detailed, vertical 9:16, 4k。
-
-【输出格式】
-请严格输出一个 JSON 对象，不能有额外文字，不能有注释，所有字符串都必须用双引号，不要有多余逗号。
-
-JSON 结构如下（请用真实内容替换示例说明）：
-
-{
-  "scene_title_zh": "给这个画面起一个简短的中文名字，例如：海岸飞行的少女",
-  "description_zh": "用 3～6 句中文详细描述画面：人物长相、穿着、动作、镜头视角、场景、光线、色彩、情绪等。",
-  "prompt_en": "对应的英文生成提示词，用一段完整英文描述上面同样的画面，适合直接给图生图/文生视频模型使用。",
-  "negative_prompt_en": "可选：英文负面提示词，例如：text, logo, watermark, subtitle, low resolution, blurry, distorted hands, extra limbs, deformed body。如果暂时不需要，可以给一个合理的默认负面词。"
-}
-
-【再次强调】
-- 只输出一个合法 JSON 对象，不能有任何额外说明。
-- 字符串使用双引号，JSON 里不要写注释。
-"""
-
-
-def analyze_image_to_prompt(
-    img: Image.Image,
-    model,
-    index: int,
-) -> Dict[str, Any]:
-    """
-    对单张图片生成：
-      - scene_title_zh
-      - description_zh
-      - prompt_en
-      - negative_prompt_en
-    """
-    prompt = get_prompt_template()
-
-    try:
-        resp = model.generate_content([prompt, img])
-        text = _extract_text_from_response(resp)
-        if not text:
-            raise ValueError("模型未返回文本")
-
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError("未检测到有效 JSON 结构")
-
-        json_str = text[start: end + 1]
-        data = json.loads(json_str)
-
-        # 兜底字段
-        data.setdefault("scene_title_zh", f"场景 {index}")
-        data.setdefault("description_zh", "")
-        data.setdefault("prompt_en", "")
-        data.setdefault("negative_prompt_en", "")
-
-        return data
-
-    except Exception as e:
-        return {
-            "scene_title_zh": f"场景 {index} · 生成失败",
-            "description_zh": f"（分析失败：{e}）",
-            "prompt_en": "",
-            "negative_prompt_en": "",
-            "error": str(e),
-        }
-
-
-# ========================
-# 侧边栏：API Key & 参数
+# 侧边栏：API Key
 # ========================
 
 with st.sidebar:
-    st.header("🔑 第一步：配置 Gemini API Key")
+    st.header("🔑 Google Gemini API Key")
     api_key = st.text_input(
-        "Google API Key",
+        "输入 Google API Key",
         type="password",
         value=st.session_state["api_key"],
-        help="粘贴你的 Gemini API Key（通常以 AIza 开头）",
+        help="在 https://ai.google.dev 获取，通常以 AIza 开头",
     )
     st.session_state["api_key"] = api_key
 
-    st.markdown("---")
-    st.caption("建议：一次分析 1~5 张图片，避免触发免费 10 RPM 限制。")
-
-    if not api_key:
-        st.warning("🔴 还没有 Key，先去 https://ai.google.dev/ 申请一个。")
+    if api_key:
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+            st.success("🟢 Key 已就绪，可以正常调用。")
+        except Exception as e:
+            st.error(f"❌ 初始化 Gemini 失败：{e}")
+            model = None
     else:
-        st.success("🟢 Key 已就绪。")
-
-
-# ========================
-# 初始化 Gemini 模型
-# ========================
-
-model = None
-if api_key:
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-    except Exception as e:
-        st.error(f"❌ 初始化 Gemini 模型失败：{e}")
         model = None
+        st.warning("🔴 请输入有效 API Key。")
 
-
-# ========================
-# 主区域：上传图片 & 分析
-# ========================
-
-st.markdown("## ① 上传图片")
-
-uploaded_files = st.file_uploader(
-    "支持多张图片（JPG / PNG / WEBP）",
-    type=["jpg", "jpeg", "png", "webp"],
-    accept_multiple_files=True,
-)
-
-analyze_btn = st.button("🚀 开始生成中文描述 + 英文提示词", type="primary")
-
-results: List[Dict[str, Any]] = []
-
-if analyze_btn:
-    if not api_key or model is None:
+# 公共小工具：调用 Gemini
+def call_gemini_text(prompt_parts):
+    if not model:
         st.error("请先在左侧输入有效的 Google API Key。")
-    else:
-        if not uploaded_files:
-            st.warning("请至少上传一张图片。")
+        return None
+    try:
+        resp = model.generate_content(prompt_parts)
+        # Gemini 通常用 resp.text 即可
+        txt = getattr(resp, "text", None)
+        if not txt:
+            # fallback
+            txt = str(resp)
+        return txt.strip()
+    except Exception as e:
+        st.error(f"调用 Gemini 出错：{e}")
+        return None
+
+
+# ========================
+# Tab 布局
+# ========================
+
+tab1, tab2, tab3 = st.tabs(["🖼 图生文（图片反推）", "📚 剧本拆分镜头", "👤 角色设定集"])
+
+
+# ========================
+# Tab1：图生文（图片反推）
+# ========================
+
+with tab1:
+    st.subheader("🖼 图生文（图片反推）")
+
+    col_img, col_ctrl = st.columns([1, 1.4])
+    with col_img:
+        uploaded_image = st.file_uploader(
+            "上传参考图片（只分析，不生成）：",
+            type=["jpg", "jpeg", "png", "webp"],
+        )
+        if uploaded_image:
+            img = Image.open(uploaded_image).convert("RGB")
+            st.image(img, caption="已上传图片预览", use_column_width=True)
         else:
-            if len(uploaded_files) > FREE_TIER_RPM_LIMIT:
-                st.warning(
-                    f"当前上传了 {len(uploaded_files)} 张图片，建议一次不超过 {FREE_TIER_RPM_LIMIT} 张，"
-                    "以避免触发免费 10 RPM 限制。"
-                )
+            img = None
 
-            with st.spinner("🧠 正在为每张图片生成中文描述和英文 Prompt..."):
-                for i, file in enumerate(uploaded_files, start=1):
-                    img = Image.open(file).convert("RGB")
-                    st.write(f"正在分析：第 {i} 张图 —— {file.name}")
-                    data = analyze_image_to_prompt(img, model, index=i)
-                    data["_meta"] = {
-                        "index": i,
-                        "filename": file.name,
-                    }
-                    results.append(data)
-
-            if results:
-                export_data = {
-                    "meta": {
-                        "model": GEMINI_MODEL_NAME,
-                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "image_count": len(results),
-                    },
-                    "items": results,
-                }
-                st.session_state["last_result"] = export_data
-
-
-# ========================
-# 展示结果：一图一张“卡片”
-# ========================
-
-if st.session_state["last_result"]:
-    export_data = st.session_state["last_result"]
-    items: List[Dict[str, Any]] = export_data["items"]
-
-    st.markdown("## ② 结果预览（中文在上，英文在下，直接复制即可）")
-
-    tab_cards, tab_json = st.tabs(["📋 按图片查看卡片", "📦 JSON 导出"])
-
-    # --- Tab1：逐图片展示 ---
-    with tab_cards:
-        for item in items:
-            meta = item.get("_meta", {})
-            idx = meta.get("index", "?")
-            filename = meta.get("filename", "unknown")
-
-            title = item.get("scene_title_zh", f"场景 {idx}")
-            desc_zh = item.get("description_zh", "")
-            prompt_en = item.get("prompt_en", "")
-            neg_en = item.get("negative_prompt_en", "")
-
-            st.markdown(f"### 🖼 图片 {idx} · {filename}")
-            st.markdown(f"**场景名称：** {title}")
-
-            # 6️⃣ 中文版画面描述
-            st.markdown("#### 6️⃣ 中文版画面描述（看这个就行）")
-            if desc_zh:
-                st.markdown(f"> {desc_zh}")
-            else:
-                st.info("暂无中文描述。")
-
-            # 6️⃣-EN 英文生成提示词
-            st.markdown("#### 6️⃣-EN 英文生成提示词（直接整段复制给模型）")
-            st.code(prompt_en or "（暂无英文提示词）", language="text")
-
-            # 负面提示词
-            st.markdown("#### 🚫 负面提示词（可选）")
-            st.code(
-                neg_en or "text, logo, watermark, subtitle, low resolution, blurry, distorted hands, extra limbs, deformed body",
-                language="text",
-            )
-
-            st.markdown("---")
-
-    # --- Tab2：JSON 导出 ---
-    with tab_json:
-        st.markdown("### 📦 下载本次生成结果 JSON")
-        json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
-        st.download_button(
-            label="⬇️ 下载 image_prompts.json",
-            data=json_str,
-            file_name="image_prompts.json",
-            mime="application/json",
+    with col_ctrl:
+        st.markdown(
+            """
+            生成内容（可以单独点击按钮调用）：
+            
+            1️⃣ **风格提示词 (Style)**：分析画面的艺术/画风关键词。  
+            2️⃣ **镜头与景别 (Shot & Composition)**：分析构图、景别、机位、光影。  
+            3️⃣ **完整提示词 (Prompt)**：生成可直接丢给模型的完整描述（中文 + 英文）。  
+            """
         )
 
-        st.markdown("### 🔍 JSON 内容预览")
-        preview = json_str[:4000] + ("\n...\n" if len(json_str) > 4000 else "")
-        st.code(preview, language="json")
-else:
-    st.info("👈 先在左侧填好 Key，上传一两张图片，然后点击“🚀 开始生成中文描述 + 英文提示词”。")
+        style_btn = st.button("🎨 生成风格提示词 (Style)")
+        shot_btn = st.button("🎥 分析镜头与景别 (Shot & Composition)")
+        prompt_btn = st.button("🧠 生成完整提示词 (Prompt)")
+
+    st.markdown("---")
+
+    # --- 风格提示词 ---
+    st.markdown('<div class="block-card">', unsafe_allow_html=True)
+    st.markdown('<div class="block-title">🎨 风格提示词 (Style)</div>', unsafe_allow_html=True)
+
+    if style_btn:
+        if not img:
+            st.error("请先上传一张图片。")
+        else:
+            prompt = """
+你现在是图片风格分析专家。
+请用中文输出以下内容，格式用 Markdown：
+
+【风格总结】
+- 用 1～2 句话概括整张图的视觉风格，例如：Q版动漫、暖色系治愈风、赛博朋克写实、3D 卡通渲染、油画风格等。
+
+【风格提示词（中文）】
+- 用逗号分隔的中文关键词，总结：画风、质感、色彩氛围、时代感，例如：
+  Q版动画风格, 治愈系, 可爱, 柔和光照, 糖果色调, 插画风, 手绘感, 高饱和度, 少女风
+
+【风格提示词（英文，可选）】
+- 如果方便，用英文再给一行对应的 style 关键词，逗号分隔，例如：
+  cute chibi anime, healing style, soft lighting, pastel colors, kawaii illustration
+"""
+            text = call_gemini_text([prompt, img])
+            if text:
+                st.markdown(text)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- 镜头与景别 ---
+    st.markdown('<div class="block-card">', unsafe_allow_html=True)
+    st.markdown('<div class="block-title">🎥 镜头与景别 (Shot & Composition)</div>', unsafe_allow_html=True)
+
+    if shot_btn:
+        if not img:
+            st.error("请先上传一张图片。")
+        else:
+            prompt = """
+你现在是电影摄影指导 + 分镜师。
+请根据这张图片，用中文分析它的镜头与景别，输出为 Markdown：
+
+【景别】
+- 远景 / 全景 / 中景 / 近景 / 特写（选择一个或多个，并说明理由）
+
+【机位与角度】
+- 机位位置：高机位 / 低机位 / 平视 / 俯视 / 仰视 / 跟拍 / 俯拍等
+- 拍摄角度：正面 / 侧面 / 斜侧 / 背面 / 45度等
+
+【构图与布局】
+- 主体在画面中的位置（居中、左侧、右侧、三分构图等）
+- 前景 / 中景 / 背景里分别有什么
+- 是否有引导线、对称、留白等构图特点
+
+【光线与氛围】
+- 光源方向（从左/右/上/后方）
+- 光线类型（直射光、散射光、逆光、轮廓光）
+- 氛围（温暖、冷峻、梦幻、压抑等）
+
+不用写英文，只要中文分析即可。
+"""
+            text = call_gemini_text([prompt, img])
+            if text:
+                st.markdown(text)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- 完整提示词 ---
+    st.markdown('<div class="block-card">', unsafe_allow_html=True)
+    st.markdown('<div class="block-title">🧠 完整提示词 (Prompt)</div>', unsafe_allow_html=True)
+
+    if prompt_btn:
+        if not img:
+            st.error("请先上传一张图片。")
+        else:
+            prompt = """
+你现在是资深提示词工程师 + 分镜导演。
+请基于这张图片，输出一段中文描述和一段英文 Prompt，格式如下（Markdown）：
+
+【中文画面描述】
+用 3～6 句中文描述画面：人物长相、穿着、动作、场景、镜头视角、光线色彩、情绪氛围等，尽量具体。
+
+【英文生成提示词（直接给模型用）】
+用一段完整英文描述同样的画面，适合给图生图/文生视频模型使用：
+- 包含：人物外观（年龄、性别、发型、服饰）、动作、场景环境、镜头视角（camera from behind / close-up 等）、光线、色彩、风格（cinematic, anime style, photorealistic 等）、画幅比例（16:9 或 9:16）。
+- 句子自然流畅，不用堆叠“masterpiece, best quality”这类老式咒语。
+- 结尾可以补充简短参数，例如：cinematic lighting, highly detailed, vertical 9:16.
+
+【负面提示词（可选，英文）】
+如果方便，请给一行英文 negative prompt，例如：
+text, logo, watermark, subtitle, low resolution, blurry, distorted hands, extra limbs, deformed body
+"""
+            text = call_gemini_text([prompt, img])
+            if text:
+                st.markdown(text)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ========================
+# Tab2：剧本拆分镜头
+# ========================
+
+with tab2:
+    st.subheader("📚 剧本拆分镜头（主镜头 + 补充镜头 + 视频生成指令）")
+
+    st.markdown(
+        """
+        核心痛点解决：普通工具一段话只生成一张图，无法表达剧情情绪，缺乏影视感。  
+        这里可以：  
+        - 自动拆解剧本 → 主镜头（Keyframe）  
+        - 自动联想并生成补充镜头（Supplementary Shots：特写、中景、全景、环境空镜）  
+        - 输出一段「视频生成指令」，指导 SORA / VEO 等生成完整片段。
+        """
+    )
+
+    script_text = st.text_area(
+        "粘贴一小段剧情 / 文案（建议 1 个场景）：",
+        height=200,
+        placeholder="例如：傍晚时分，林晓雨在旧木箱中发现了一只古老的铜哨……",
+    )
+    max_shots = st.slider(
+        "希望拆成多少个补充镜头（不含主镜头）",
+        min_value=2,
+        max_value=6,
+        value=4,
+    )
+    scene_btn = st.button("🎬 开始拆分镜头", key="scene_btn")
+
+    if scene_btn:
+        if not script_text.strip():
+            st.error("请先粘贴一段剧情文本。")
+        else:
+            prompt = f"""
+你现在是资深分镜导演 + 剧本统筹。
+我给你一段剧情文本，请你拆解成「主镜头 + 补充镜头 + 视频生成指令」，全部用中文输出，格式参照下方要求。
+
+【输入剧情】
+{script_text}
+
+【输出格式（Markdown）】
+
+### Scene 1 场景概述
+- 用 1～2 句话概括这一段剧情的核心信息和情绪基调。
+
+### 主镜头 (Main Keyframe)
+- 用 3～6 句话详细描述一个“代表性画面”，作为整段剧情的主海报 / 主 keyframe：
+  - 描述人物是谁、穿什么、长什么样；
+  - 画面中人物在做什么；
+  - 场景是哪里（室内/室外/城市/乡村/奇幻世界等）；
+  - 镜头是什么景别、机位、光线和色彩氛围。
+
+### 补充镜头 & 视觉细节 (Supplementary Shots)
+请生成 {max_shots} 个补充镜头，每个用 2～4 句话描述，覆盖不同景别和视角，比如：
+- 图1（特写）：例如人物手部特写、表情特写、重要道具等；
+- 图2（中景）：例如人物互动、对话、情绪反应；
+- 图3（全景 / 环境）：例如室内全景、街道全景、山谷、城市夜景等；
+- 图4...：可以是动态场面、空镜、氛围镜头等。
+
+每个镜头用“图X 标题：”开头，然后下面分行写出画面描述，尽量带上景别、机位和情绪。
+
+### 视频生成指令 (Video Generation)
+- 用 1～3 段中文描述「如果要把这段剧情做成 8～15 秒视频，镜头应该怎么运动、按什么顺序出现」：
+  - 从哪一个镜头开始（开场镜头）；
+  - 镜头如何切换（从主镜头推近到特写，或从室内切到室外全景等）；
+  - 节奏是慢慢铺垫还是快速剪辑；
+  - 可以提一句建议给 SORA / VEO 的英文提示简要（可选）。
+
+只输出 Markdown，不要任何额外解释。
+"""
+            text = call_gemini_text(prompt)
+            if text:
+                st.markdown("---")
+                st.markdown("### 📖 拆分结果")
+                st.markdown(text)
+
+
+# ========================
+# Tab3：角色设定集
+# ========================
+
+with tab3:
+    st.subheader("👤 角色设定集（多风格三视图提示词）")
+
+    st.markdown(
+        """
+        核心痛点解决：AI 生成的视频中人物长相经常不一致，无法做连续剧。  
+        这个功能不炼模型，只生成<b>提示词版的“角色设定集”</b>，帮助你在不同场景、不同风格里保持同一角色的一致性。
+        
+        功能要点：
+        - 上传一张角色形象照片 / 立绘（脸部尽量清晰）；
+        - 选择一个主风格（古风、都市白领、修仙、校园校服等）；
+        - 输出：  
+          - 角色基础设定（人设 + 外貌 + 性格）；  
+          - 脸部三视图提示词（正脸、侧脸、背面/远景）；  
+          - 8 种不同风格的人物全景三视图 Prompt（方便你后面“换装”而不换脸）。
+        """
+    )
+
+    col_role_img, col_role_ctrl = st.columns([1, 1.4])
+
+    with col_role_img:
+        role_image = st.file_uploader(
+            "上传角色形象图片（只分析，不生成）：",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="role_img",
+        )
+        if role_image:
+            role_img = Image.open(role_image).convert("RGB")
+            st.image(role_img, caption="角色图片预览", use_column_width=True)
+        else:
+            role_img = None
+
+    with col_role_ctrl:
+        style_options = [
+            "古风侠客",
+            "都市白领",
+            "修仙风格",
+            "校园校服",
+            "赛博朋克",
+            "机甲科幻",
+            "运动活力",
+            "可爱治愈",
+        ]
+        main_style = st.selectbox("选择一个主打风格（可在 Prompt 中重点强化）：", style_options)
+        role_btn = st.button("👤 生成角色设定集提示词")
+
+    if role_btn:
+        if not role_img:
+            st.error("请先上传一张角色图片。")
+        else:
+            prompt = f"""
+你现在是角色设定师 + 提示词工程师。
+根据这张角色图片，生成一个“文字版角色设定集”，用于后续在不同 AI 模型中保持人物一致性。
+注意：只输出文本提示词，不生成图片、不讨论训练 LoRA。
+
+主打风格：{main_style}
+
+【输出格式（Markdown，全中文描述 + 英文 prompt 混排）】
+
+### 1. 角色基础设定（Character Bible）
+- 角色中文名（可以虚构）：  
+- 年龄、性别、性格关键词：  
+- 外貌概括：脸型、五官特点、发型发色，是否有标志性特征（例如：红色发带、眼下泪痣等）；  
+- 身形（高矮胖瘦）、气质（温柔、冷酷、元气、成熟等）；  
+- 主打风格设定（结合“{main_style}”），例如：古风侠客 / 都市白领等。
+
+### 2. 脸部三视图（Face Views）提示词
+请用中英结合的方式，给出三个视角的提示词，每个 1～2 句：
+- 正脸（Front view）：中文简述 + 对应英文提示句  
+- 侧脸（Side view）：中文简述 + 英文  
+- 背面或远景（Back / Distant view）：中文简述 + 英文  
+
+### 3. 8 种风格的人物全景三视图 Prompt（不换脸，只换穿搭和氛围）
+为保证角色可以“穿梭不同剧本场景”，请围绕同一张脸，设计 8 种不同服装/氛围的全身三视图 Prompt。
+每种风格用小标题列出，格式示例：
+
+#### 风格A：古风侠客
+- 中文：用 2～3 句中文描述这个角色在“古风侠客”设定下的全身造型（服装、武器、姿态、场景），注意脸还是同一个人。  
+- 英文 Prompt：对应的一段英文提示词，可以直接给图生图/视频模型使用（包括 front / side / back 全身视角的说明）。
+
+#### 风格B：都市白领
+（同上结构）
+
+……
+风格列表请至少包含：古风、都市白领、修仙风格、校园校服、赛博朋克、机甲科幻、运动活力、可爱治愈这 8 类。
+
+所有输出都用 Markdown 格式排版，方便复制。
+"""
+            text = call_gemini_text([prompt, role_img])
+            if text:
+                st.markdown("---")
+                st.markdown("### 📚 角色设定集（可复制保存）")
+                st.markdown(text)
