@@ -7,21 +7,28 @@ from typing import Any, Dict, List, Optional, Union
 import streamlit as st
 from PIL import Image
 
-from zai import ZhipuAiClient  # zai-sdk
-
+# ============ 关键：使用 zai-sdk ============
+try:
+    # zai-sdk 常见写法：from zai import ZhipuAiClient, ZaiClient
+    from zai import ZhipuAiClient, ZaiClient
+except Exception as e:
+    st.error(
+        "缺少依赖 zai-sdk 或导入失败。请在 requirements.txt 添加：zai-sdk>=0.1.0，然后重新构建。\n\n"
+        f"导入错误：{e}"
+    )
+    st.stop()
 
 # ========================
 # 基本配置
 # ========================
-APP_TITLE = "TapNow · 图生文 / 剧本拆镜头 / 角色设定集 + 历史记录（ZHIPU ONLINE v1.0）"
+APP_TITLE = "TapNow · 图生文 / 剧本拆镜头 / 角色设定集 + 历史记录（ZHIPU ONLINE v1.1）"
 DEFAULT_TEXT_MODEL = "glm-4"
-DEFAULT_VISION_MODEL = "glm-4v"  # 你也可用 glm-4v-plus-0111 等
+DEFAULT_VISION_MODEL = "glm-4v"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
 
-
 # ========================
-# 初始化 session_state
+# Session State
 # ========================
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = (os.getenv("ZHIPUAI_API_KEY") or "").strip()
@@ -41,18 +48,53 @@ if "temperature" not in st.session_state:
 if "max_tokens" not in st.session_state:
     st.session_state["max_tokens"] = 2048
 
+if "base_url" not in st.session_state:
+    st.session_state["base_url"] = "https://open.bigmodel.cn/api/paas/v4/"
+
+if "image_payload_mode" not in st.session_state:
+    # data-url 更通用；raw-base64 兼容部分实现
+    st.session_state["image_payload_mode"] = "data-url"
+
+if "debug_print" not in st.session_state:
+    st.session_state["debug_print"] = True
+
+if "last_call" not in st.session_state:
+    st.session_state["last_call"] = None
+
+if "client_conf" not in st.session_state:
+    st.session_state["client_conf"] = None
+
+if "client" not in st.session_state:
+    st.session_state["client"] = None
+
 
 # ========================
-# 全局样式：白底 + 卡片
+# 全局样式
 # ========================
 st.markdown(
     """
     <style>
-    .stApp { background-color: #f5f5f5; color: #111827;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    .block-card { background-color: #ffffff; border-radius: 12px; padding: 16px 20px;
-        margin-bottom: 16px; border: 1px solid #e5e7eb; }
-    .block-title { font-size: 1rem; font-weight: 600; margin-bottom: 8px; }
+    .stApp {
+        background-color: #f5f5f5;
+        color: #111827;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .block-card {
+        background-color: #ffffff;
+        border-radius: 12px;
+        padding: 16px 20px;
+        margin-bottom: 16px;
+        border: 1px solid #e5e7eb;
+    }
+    .block-title {
+        font-size: 1rem;
+        font-weight: 600;
+        margin-bottom: 8px;
+    }
+    .mini-muted {
+        color: #6b7280;
+        font-size: 0.88rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -63,59 +105,137 @@ st.markdown(
     <div style="
         padding: 18px 24px;
         border-radius: 16px;
-        margin-bottom: 16px;
+        margin-bottom: 12px;
         background: linear-gradient(135deg, #22c55e, #0ea5e9);
-        color: #f9fafb;">
+        color: #f9fafb;
+    ">
       <h1 style="margin: 0 0 6px 0; font-size: 1.6rem;">🎬 {APP_TITLE}</h1>
       <p style="margin: 0; font-size: 0.96rem;">
-        一站式提示词工具：图生文（图片反推）、剧本拆分镜头、角色设定集，并自动记录历史结果，方便后期查看和复用。
+        服务端调用智谱接口（可选域名），图生文 / 拆镜头 / 角色设定集，并自动保存历史。
       </p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+# 最近一次调用信息（让你“看见”它确实在请求智谱）
+last_call = st.session_state.get("last_call")
+if last_call:
+    st.markdown(
+        f"""
+        <div class="block-card">
+          <div class="block-title">✅ 最近一次调用信息（服务端 -> 智谱接口）</div>
+          <div class="mini-muted">
+            时间：{last_call.get("time")}<br/>
+            base_url：{last_call.get("base_url")}<br/>
+            model：{last_call.get("model")}<br/>
+            mode：{last_call.get("mode")}<br/>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 # ========================
-# 工具：PIL -> base64
+# 工具函数：图片编码
 # ========================
-def pil_to_base64(img: Image.Image, fmt: str = "JPEG", quality: int = 95) -> str:
-    """输出纯 base64 字符串（不含 data:image/... 前缀），用于文档示例里的 base64 传法。"""
+def pil_to_jpeg_bytes(img: Image.Image, quality: int = 92) -> bytes:
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format=fmt, quality=quality)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+    img.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def pil_to_base64(img: Image.Image) -> str:
+    return base64.b64encode(pil_to_jpeg_bytes(img)).decode("utf-8")
+
+
+def build_image_url_payload(img: Image.Image) -> str:
+    """
+    返回 image_url.url 的内容：
+    - data-url：data:image/jpeg;base64,xxxx（最通用）
+    - raw-base64：xxxx（少数实现支持）
+    """
+    b64 = pil_to_base64(img)
+    mode = st.session_state.get("image_payload_mode", "data-url")
+    if mode == "raw-base64":
+        return b64
+    return f"data:image/jpeg;base64,{b64}"
 
 
 # ========================
-# 侧边栏：API Key / 参数
+# 客户端初始化（带 base_url）
+# ========================
+def get_or_init_client(api_key: str, base_url: str):
+    """
+    根据 base_url 自动选 ZhipuAiClient / ZaiClient，并做 session 缓存。
+    """
+    conf = {"api_key": api_key, "base_url": base_url}
+
+    # 若配置未变化，复用旧 client
+    if st.session_state.get("client") is not None and st.session_state.get("client_conf") == conf:
+        return st.session_state["client"]
+
+    # 否则重建
+    if "open.bigmodel.cn" in base_url:
+        client = ZhipuAiClient(api_key=api_key, base_url=base_url)
+    else:
+        client = ZaiClient(api_key=api_key, base_url=base_url)
+
+    st.session_state["client"] = client
+    st.session_state["client_conf"] = conf
+    return client
+
+
+def record_last_call(model: str, mode: str):
+    st.session_state["last_call"] = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "base_url": st.session_state.get("base_url"),
+        "model": model,
+        "mode": mode,
+    }
+
+
+def dbg_print(msg: str):
+    if st.session_state.get("debug_print", True):
+        print(msg, flush=True)
+
+
+# ========================
+# 侧边栏
 # ========================
 with st.sidebar:
-    st.header("🔑 智谱（Z.AI / BigModel）API Key")
+    st.header("🔑 智谱 / Z.ai API Key")
 
     api_key = st.text_input(
-        "输入智谱 API Key（或在 Zeabur 设置环境变量 ZHIPUAI_API_KEY）",
+        "输入 API Key（或设置环境变量 ZHIPUAI_API_KEY）",
         type="password",
         value=st.session_state["api_key"],
-        help="注意：复制粘贴时不要带空格/换行",
     )
-    # ✅ 关键：清洗 key，避免 runtime 里出现 illegal header value
+
+    # 关键：清洗 key，避免 illegal header value（换行/空格）
     api_key = (api_key or "").strip().replace("\r", "").replace("\n", "")
     st.session_state["api_key"] = api_key
 
     st.divider()
-    st.subheader("⚙️ 模型与采样参数")
+    st.subheader("🌐 选择调用域名（base_url）")
 
-    st.session_state["text_model"] = st.text_input(
-        "文本模型（剧本拆镜头用）",
-        value=st.session_state["text_model"],
-        help="示例：glm-4 / glm-4-plus / glm-4-flash（以你账号可用为准）",
+    base_url = st.selectbox(
+        "base_url",
+        [
+            "https://open.bigmodel.cn/api/paas/v4/",
+            "https://api.z.ai/api/paas/v4/",
+        ],
+        index=0 if "open.bigmodel.cn" in st.session_state["base_url"] else 1,
     )
+    st.session_state["base_url"] = base_url
+    st.caption(f"当前 base_url：{base_url}")
 
-    st.session_state["vision_model"] = st.text_input(
-        "多模态模型（图片分析用）",
-        value=st.session_state["vision_model"],
-        help="示例：glm-4v / glm-4v-plus-0111（以你账号可用为准）",
-    )
+    st.divider()
+    st.subheader("⚙️ 模型与参数")
+
+    st.session_state["text_model"] = st.text_input("文本模型", value=st.session_state["text_model"])
+    st.session_state["vision_model"] = st.text_input("多模态模型", value=st.session_state["vision_model"])
 
     st.session_state["temperature"] = st.slider(
         "temperature", 0.0, 1.0, float(st.session_state["temperature"]), 0.05
@@ -124,39 +244,78 @@ with st.sidebar:
         "max_tokens", 256, 8192, int(st.session_state["max_tokens"]), 128
     )
 
+    st.session_state["image_payload_mode"] = st.selectbox(
+        "图片传输方式（image_url.url）",
+        ["data-url", "raw-base64"],
+        index=0 if st.session_state["image_payload_mode"] == "data-url" else 1,
+        help="推荐 data-url；如果你的账号/网关只接受裸 base64，可切 raw-base64。",
+    )
+
+    st.session_state["debug_print"] = st.checkbox("在 Zeabur Logs 打印调试信息", value=st.session_state["debug_print"])
+
     st.divider()
 
+    # 初始化 client（只要 key 存在就尝试）
+    client = None
     if api_key:
         try:
-            client = ZhipuAiClient(api_key=api_key)
-            st.success("🟢 Key 已就绪，可调用智谱模型。")
+            client = get_or_init_client(api_key, base_url)
+            st.success("Key 已就绪。")
         except Exception as e:
-            st.error(f"❌ 初始化智谱 SDK 失败：{e}")
+            st.error(f"初始化失败：{e}")
             client = None
     else:
-        client = None
-        st.warning("🔴 请输入有效 API Key 或设置环境变量 ZHIPUAI_API_KEY。")
+        st.warning("请输入 API Key。")
+
+    # Ping 测试：让你在 Runtime Logs 里看到真实调用域名
+    if st.button("🔎 Ping 测试（真实调用一次接口）"):
+        if not api_key:
+            st.error("请先输入 API Key。")
+        else:
+            try:
+                client = get_or_init_client(api_key, base_url)
+                dbg_print(f"[PING] calling {base_url} model={st.session_state['text_model']} ...")
+                r = client.chat.completions.create(
+                    model=st.session_state["text_model"],
+                    messages=[{"role": "user", "content": "ping"}],
+                    temperature=0.2,
+                    max_tokens=32,
+                )
+                msg = (r.choices[0].message.content or "").strip()
+                record_last_call(st.session_state["text_model"], "text")
+                dbg_print(f"[PING] ok: {msg[:120]}")
+                st.success(f"Ping 成功：{msg[:80]}")
+            except Exception as e:
+                st.error(f"Ping 失败：{e}")
 
 
 # ========================
-# 公共调用封装
+# 调用封装
 # ========================
-def call_zhipu(
+def call_llm(
     prompt_or_parts: Union[str, List[Any]],
     image: Optional[Image.Image] = None,
 ) -> Optional[str]:
     """
-    - 纯文本：走 text_model
-    - 图文：走 vision_model，messages.content 为 [{type:text},{type:image_url}]
+    - 纯文本：text_model
+    - 图文：vision_model（messages.content: text + image_url）
     """
-    if client is None:
-        st.error("请先在左侧输入有效的智谱 API Key。")
+    api_key_local = st.session_state.get("api_key", "")
+    base_url_local = st.session_state.get("base_url", "")
+    if not api_key_local:
+        st.error("请先在左侧输入 API Key。")
+        return None
+
+    try:
+        c = get_or_init_client(api_key_local, base_url_local)
+    except Exception as e:
+        st.error(f"初始化 client 失败：{e}")
         return None
 
     temperature = float(st.session_state["temperature"])
     max_tokens = int(st.session_state["max_tokens"])
 
-    # 兼容传参：[prompt, img]
+    # 兼容旧写法：[prompt, img]
     if isinstance(prompt_or_parts, list):
         prompt_text = ""
         found_img = None
@@ -173,34 +332,41 @@ def call_zhipu(
 
     try:
         if image is not None:
-            # Base64 传图（官方示例支持 base64 放到 image_url.url）：
-            img_b64 = pil_to_base64(image)
-            resp = client.chat.completions.create(
-                model=st.session_state["vision_model"],
+            model = st.session_state["vision_model"]
+            img_payload = build_image_url_payload(image)
+
+            dbg_print(f"[CALL] base_url={base_url_local} model={model} mode=vision")
+            resp = c.chat.completions.create(
+                model=model,
                 messages=[
                     {
                         "role": "user",
                         "content": [
                             {"type": "text", "text": prompt_text},
-                            {"type": "image_url", "image_url": {"url": img_b64}},
+                            {"type": "image_url", "image_url": {"url": img_payload}},
                         ],
                     }
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+            record_last_call(model, "vision")
         else:
-            resp = client.chat.completions.create(
-                model=st.session_state["text_model"],
+            model = st.session_state["text_model"]
+            dbg_print(f"[CALL] base_url={base_url_local} model={model} mode=text")
+            resp = c.chat.completions.create(
+                model=model,
                 messages=[{"role": "user", "content": prompt_text}],
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+            record_last_call(model, "text")
 
-        return (resp.choices[0].message.content or "").strip()
+        text = (resp.choices[0].message.content or "").strip()
+        return text
 
     except Exception as e:
-        st.error(f"调用智谱出错：{e}")
+        st.error(f"调用失败：{e}")
         return None
 
 
@@ -228,7 +394,6 @@ tab1, tab2, tab3, tab4 = st.tabs(
     ["🖼 图生文（图片反推）", "📚 剧本拆分镜头", "👤 角色设定集", "📂 历史记录"]
 )
 
-
 # ========================
 # Tab1：图生文
 # ========================
@@ -251,9 +416,9 @@ with tab1:
         st.markdown(
             """
             **三个功能分开使用：**
-            1️⃣ **风格提示词 (Style)**：画风、质感、色彩氛围等关键词。  
-            2️⃣ **镜头与景别 (Shot & Composition)**：景别、机位、构图、光影。  
-            3️⃣ **完整提示词 (Prompt)**：中文描述 + 英文 Prompt，直接可用。
+            1️⃣ **风格提示词**：画风、质感、色彩氛围等关键词  
+            2️⃣ **镜头与景别**：景别、机位、构图、光影  
+            3️⃣ **完整提示词**：中文描述 + 英文 Prompt（可直接用）
             """
         )
         style_btn = st.button("🎨 生成风格提示词 (Style)")
@@ -269,18 +434,12 @@ with tab1:
             st.error("请先上传一张图片。")
         else:
             prompt = """
-你现在是图片风格分析专家。请用中文输出以下内容，格式用 Markdown：
-
-【风格总结】
-- 用 1～2 句话概括整张图的视觉风格。
-
-【风格提示词（中文）】
-- 用逗号分隔的中文关键词，总结：画风、质感、色彩氛围、时代感。
-
-【风格提示词（英文，可选）】
-- 如果方便，用英文再给一行对应的 style 关键词，逗号分隔。
+你现在是图片风格分析专家。请用中文输出（Markdown）：
+【风格总结】1～2 句概括视觉风格
+【风格提示词（中文）】逗号分隔关键词（画风/质感/色彩/氛围/时代感）
+【风格提示词（英文，可选）】对应英文关键词（逗号分隔）
 """
-            text = call_zhipu([prompt, img])
+            text = call_llm([prompt, img])
             if text:
                 st.markdown(text)
                 add_history(
@@ -289,10 +448,9 @@ with tab1:
                     {"filename": uploaded_image.name if uploaded_image else ""},
                     text,
                 )
-
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- Shot & Composition ---
+    # --- Shot ---
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
     st.markdown('<div class="block-title">🎥 镜头与景别 (Shot & Composition)</div>', unsafe_allow_html=True)
 
@@ -301,15 +459,13 @@ with tab1:
             st.error("请先上传一张图片。")
         else:
             prompt = """
-你现在是电影摄影指导 + 分镜师。
-请根据这张图片，用中文分析它的镜头与景别，输出为 Markdown：
-
-【景别】
-【机位与角度】
-【构图与布局】
-【光线与氛围】
+你现在是电影摄影指导 + 分镜师。请根据图像输出（Markdown）：
+【景别】远/全/中/近/特写（说明理由）
+【机位与角度】高/低/平视/俯视/仰视/跟拍等 + 正面/侧面/45度等
+【构图与布局】主体位置、前中后景、引导线/对称/留白等
+【光线与氛围】光源方向、直射/散射/逆光/轮廓光、情绪氛围
 """
-            text = call_zhipu([prompt, img])
+            text = call_llm([prompt, img])
             if text:
                 st.markdown(text)
                 add_history(
@@ -318,7 +474,6 @@ with tab1:
                     {"filename": uploaded_image.name if uploaded_image else ""},
                     text,
                 )
-
     st.markdown("</div>", unsafe_allow_html=True)
 
     # --- Full Prompt ---
@@ -330,14 +485,12 @@ with tab1:
             st.error("请先上传一张图片。")
         else:
             prompt = """
-你现在是资深提示词工程师 + 分镜导演。
-请基于这张图片，输出以下内容（Markdown）：
-
-【中文画面描述】（3～6 句，具体到人物/动作/场景/镜头/光线/情绪）
-【英文生成提示词】（自然流畅的一段英文，可用于图生图/文生视频，末尾给 vertical 9:16 等参数）
-【负面提示词（可选，英文）】（如 text, logo, watermark...）
+你现在是资深提示词工程师 + 分镜导演。请输出（Markdown）：
+【中文画面描述】3～6 句（人物外观/动作/场景/镜头/光线/情绪，越具体越好）
+【英文生成提示词】自然流畅一段英文（适合图生图/文生视频），末尾加 vertical 9:16, cinematic lighting 等参数
+【负面提示词（可选，英文）】如 text, logo, watermark, low-res, blurry, deformed hands...
 """
-            text = call_zhipu([prompt, img])
+            text = call_llm([prompt, img])
             if text:
                 st.markdown(text)
                 add_history(
@@ -346,7 +499,6 @@ with tab1:
                     {"filename": uploaded_image.name if uploaded_image else ""},
                     text,
                 )
-
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -358,8 +510,8 @@ with tab2:
 
     st.markdown(
         """
-**痛点解决：** 普通工具“一段话只出一张图”，剧情和情绪无法完整表达。  
-这里会输出：主镜头 + 多个补充镜头 + 视频生成指令。
+**痛点解决：** 普通工具“一段话只出一张图”，剧情与情绪无法完整表达。  
+这里会输出：主镜头（Main Keyframe）+ 多个补充镜头 + 视频生成指令（8～15秒）。
         """
     )
 
@@ -385,10 +537,10 @@ with tab2:
 【输出格式（Markdown）】
 ### Scene 1 场景概述
 ### 主镜头 (Main Keyframe)
-### 补充镜头 & 视觉细节（共 {max_shots} 个，图1/图2/…）
+### 补充镜头 & 视觉细节（共 {max_shots} 个，图1/图2/…，每个 2～4 句）
 ### 视频生成指令 (Video Generation)（8～15 秒镜头顺序、运动、剪辑节奏）
 """
-            text = call_zhipu(prompt)
+            text = call_llm(prompt)
             if text:
                 st.markdown("---")
                 st.markdown("### 📖 拆分结果")
@@ -405,13 +557,12 @@ with tab2:
 # Tab3：角色设定集
 # ========================
 with tab3:
-    st.subheader("👤 角色设
-设定集（多风格三视图提示词）")
+    st.subheader("👤 角色设定集（多风格三视图提示词）")
 
     st.markdown(
         """
 **痛点解决：** AI 视频里人物长相经常变化。  
-这里生成“文字版角色设定集”（不训练 LoRA），帮助你在不同场景中保持同一个角色。
+这里生成“文字版角色设定集”（不训练 LoRA），帮助你保持人物一致性。
         """
     )
 
@@ -449,16 +600,28 @@ with tab3:
         else:
             prompt = f"""
 你现在是角色设定师 + 提示词工程师。
-根据这张角色图片，生成“文字版角色设定集”，用于后续在不同 AI 模型中保持人物一致性。
-注意：只输出文本提示词，不生成图片，不讨论训练 LoRA。
+根据这张角色图片，生成一个“文字版角色设定集”，用于后续在不同模型中保持人物一致性。
+注意：只输出提示词，不生成图片，不讨论训练 LoRA。
 主打风格：{main_style}
 
 【输出格式（Markdown）】
 ### 1. 角色基础设定（Character Bible）
-### 2. 脸部三视图（Face Views）提示词（正脸/侧脸/背面或远景，中英结合）
-### 3. 8 种风格的全景三视图 Prompt（不换脸，只换穿搭与氛围：古风/白领/修仙/校服/赛博/机甲/运动/治愈）
+- 角色中文名（可虚构）
+- 年龄、性别、性格关键词
+- 外貌概括（脸型/五官/发型发色/标志特征）
+- 身形与气质
+- 主打风格设定（结合 {main_style}）
+
+### 2. 脸部三视图（Face Views）提示词（中英结合）
+- 正脸（Front）
+- 侧脸（Side）
+- 背面或远景（Back / Distant）
+
+### 3. 8 种风格的全景三视图 Prompt（不换脸，只换穿搭与氛围）
+至少包含：古风、白领、修仙、校服、赛博、机甲、运动、治愈
+每种：中文 2～3 句 + 英文 Prompt（包含 front/side/back 全身视角说明）
 """
-            text = call_zhipu([prompt, role_img])
+            text = call_llm([prompt, role_img])
             if text:
                 st.markdown("---")
                 st.markdown("### 📚 角色设定集（可复制保存）")
