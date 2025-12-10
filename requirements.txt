@@ -1,6 +1,3 @@
 streamlit
-google-generativeai
 pillow
-opencv-python-headless
-numpy
-yt-dlp
+zhipuai>=2.0.1
