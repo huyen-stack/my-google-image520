@@ -1,22 +1,34 @@
-import streamlit as st
-import google.generativeai as genai
-from PIL import Image
-from datetime import datetime
+import base64
+import io
 import json
-from typing import Dict, Any, List
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
+
+import streamlit as st
+from PIL import Image
+
+from zhipuai import ZhipuAI  # ✅ 智谱 SDK
+
 
 # ========================
 # 基本配置
 # ========================
+APP_TITLE = "TapNow 风格 · 图生文 / 剧本拆镜头 / 角色设定集 + 历史记录（智谱版）"
 
-APP_TITLE = "TapNow 风格 · 图生文 / 剧本拆镜头 / 角色设定集 + 历史记录"
-GEMINI_MODEL_NAME = "gemini-flash-latest"
+# ✅ 默认模型：你可以在侧边栏改成别的
+DEFAULT_TEXT_MODEL = "glm-4"
+DEFAULT_VISION_MODEL = "glm-4v"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
 
+
+# ========================
 # 初始化 session_state
+# ========================
 if "api_key" not in st.session_state:
-    st.session_state["api_key"] = ""
+    # 优先从 secrets 读取（可选）
+    st.session_state["api_key"] = st.secrets.get("ZHIPUAI_API_KEY", "")
+
 if "history" not in st.session_state:
     # 每项结构：
     # {
@@ -25,15 +37,26 @@ if "history" not in st.session_state:
     #   "title": str,
     #   "timestamp": str,
     #   "input": dict or str,
-    #   "content": str  # Markdown / 文本
+    #   "content": str
     # }
     st.session_state["history"] = []
+
+if "text_model" not in st.session_state:
+    st.session_state["text_model"] = DEFAULT_TEXT_MODEL
+
+if "vision_model" not in st.session_state:
+    st.session_state["vision_model"] = DEFAULT_VISION_MODEL
+
+if "temperature" not in st.session_state:
+    st.session_state["temperature"] = 0.5
+
+if "max_tokens" not in st.session_state:
+    st.session_state["max_tokens"] = 2048
 
 
 # ========================
 # 全局样式：白底 + 卡片
 # ========================
-
 st.markdown(
     """
     <style>
@@ -79,55 +102,156 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ========================
-# 侧边栏：API Key
-# ========================
 
+# ========================
+# 智谱：图片编码工具
+# ========================
+def pil_to_data_url(img: Image.Image, mime: str = "image/jpeg") -> str:
+    """
+    把 PIL Image 编码成 data URL（base64），用于 glm-4v 多模态输入。
+    """
+    buf = io.BytesIO()
+    # 统一转 RGB，避免 PNG 透明通道等造成异常
+    rgb = img.convert("RGB")
+    # 这里用 JPEG 编码更通用（glm-4v 支持 jpg/png/jpeg；你也可以改成 PNG）
+    rgb.save(buf, format="JPEG", quality=95)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+# ========================
+# 侧边栏：API Key / 模型设置
+# ========================
 with st.sidebar:
-    st.header("🔑 Google Gemini API Key")
+    st.header("🔑 智谱（ZhipuAI / bigmodel）API Key")
+
     api_key = st.text_input(
-        "输入 Google API Key",
+        "输入智谱 API Key",
         type="password",
         value=st.session_state["api_key"],
-        help="在 https://ai.google.dev 获取，通常以 AIza 开头",
+        help="在 open.bigmodel.cn 创建 Key（智谱开放平台）",
     )
     st.session_state["api_key"] = api_key
 
+    st.divider()
+    st.subheader("⚙️ 模型与参数")
+
+    st.session_state["text_model"] = st.text_input(
+        "文本模型（剧本拆镜头用）",
+        value=st.session_state["text_model"],
+        help="例如：glm-4 / glm-4-plus / glm-4-flash（以你后台可用为准）",
+    )
+
+    st.session_state["vision_model"] = st.text_input(
+        "图文多模态模型（图片分析用）",
+        value=st.session_state["vision_model"],
+        help="例如：glm-4v / glm-4v-plus / glm-4v-flash（以你后台可用为准）",
+    )
+
+    st.session_state["temperature"] = st.slider(
+        "temperature",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(st.session_state["temperature"]),
+        step=0.05,
+    )
+
+    st.session_state["max_tokens"] = st.slider(
+        "max_tokens",
+        min_value=256,
+        max_value=8192,
+        value=int(st.session_state["max_tokens"]),
+        step=128,
+    )
+
+    st.divider()
+
     if api_key:
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-            st.success("🟢 Key 已就绪，可以正常调用。")
+            client = ZhipuAI(api_key=api_key)
+            st.success("🟢 Key 已就绪，可以正常调用智谱模型。")
         except Exception as e:
-            st.error(f"❌ 初始化 Gemini 失败：{e}")
-            model = None
+            st.error(f"❌ 初始化智谱 SDK 失败：{e}")
+            client = None
     else:
-        model = None
+        client = None
         st.warning("🔴 请输入有效 API Key。")
 
 
 # ========================
 # 公共小工具
 # ========================
-
-def call_gemini_text(prompt_parts) -> str | None:
-    """统一封装 Gemini 文本调用"""
-    if not model:
-        st.error("请先在左侧输入有效的 Google API Key。")
+def call_zhipu(
+    prompt_or_parts: Union[str, List[Any]],
+    image: Optional[Image.Image] = None,
+) -> Optional[str]:
+    """
+    统一封装智谱调用：
+    - 纯文本：glm-4 / glm-4-plus 等
+    - 图文多模态：glm-4v 等（messages.content 为 [{type:text},{type:image_url}]）
+    """
+    if client is None:
+        st.error("请先在左侧输入有效的智谱 API Key。")
         return None
+
+    temperature = float(st.session_state["temperature"])
+    max_tokens = int(st.session_state["max_tokens"])
+
     try:
-        resp = model.generate_content(prompt_parts)
-        txt = getattr(resp, "text", None)
-        if not txt:
-            txt = str(resp)
-        return txt.strip()
+        # 兼容你旧代码的“[prompt, img]”传参方式
+        if isinstance(prompt_or_parts, list):
+            # 从 list 里抽取 prompt 与 image（如果有）
+            prompt_text = ""
+            found_img = None
+            for p in prompt_or_parts:
+                if isinstance(p, Image.Image):
+                    found_img = p
+                elif isinstance(p, str):
+                    prompt_text += (p + "\n")
+                else:
+                    prompt_text += (str(p) + "\n")
+            prompt_text = prompt_text.strip()
+            if image is None:
+                image = found_img
+        else:
+            prompt_text = str(prompt_or_parts).strip()
+
+        # 图文多模态
+        if image is not None:
+            model_name = st.session_state["vision_model"]
+            data_url = pil_to_data_url(image, mime="image/jpeg")
+
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    }
+                ],
+                extra_body={"temperature": temperature, "max_tokens": max_tokens},
+            )
+            # 兼容不同返回结构
+            return (resp.choices[0].message.content or "").strip()
+
+        # 纯文本
+        model_name = st.session_state["text_model"]
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt_text}],
+            extra_body={"temperature": temperature, "max_tokens": max_tokens},
+        )
+        return (resp.choices[0].message.content or "").strip()
+
     except Exception as e:
-        st.error(f"调用 Gemini 出错：{e}")
+        st.error(f"调用智谱出错：{e}")
         return None
 
 
 def add_history(item_type: str, title: str, input_data: Any, content: str):
-    """把一次生成结果加入历史记录"""
     history: List[Dict[str, Any]] = st.session_state["history"]
     item_id = len(history) + 1
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -147,7 +271,6 @@ def add_history(item_type: str, title: str, input_data: Any, content: str):
 # ========================
 # Tab 布局
 # ========================
-
 tab1, tab2, tab3, tab4 = st.tabs(
     ["🖼 图生文（图片反推）", "📚 剧本拆分镜头", "👤 角色设定集", "📂 历史记录"]
 )
@@ -156,7 +279,6 @@ tab1, tab2, tab3, tab4 = st.tabs(
 # ========================
 # Tab1：图生文
 # ========================
-
 with tab1:
     st.subheader("🖼 图生文（图片反推）")
 
@@ -168,11 +290,7 @@ with tab1:
         )
         if uploaded_image:
             img = Image.open(uploaded_image).convert("RGB")
-            st.image(
-                img,
-                caption=f"已上传：{uploaded_image.name}",
-                width=420,
-            )
+            st.image(img, caption=f"已上传：{uploaded_image.name}", width=420)
         else:
             img = None
 
@@ -183,7 +301,7 @@ with tab1:
 
             1️⃣ **风格提示词 (Style)**：画风、质感、色彩氛围等关键词。  
             2️⃣ **镜头与景别 (Shot & Composition)**：景别、机位、构图、光影。  
-            3️⃣ **完整提示词 (Prompt)**：中文描述 + 对应英文 Prompt，直接丢给模型用。  
+            3️⃣ **完整提示词 (Prompt)**：中文描述 + 对应英文 Prompt，直接丢给模型用。
             """
         )
         style_btn = st.button("🎨 生成风格提示词 (Style)")
@@ -213,7 +331,7 @@ with tab1:
 - 如果方便，用英文再给一行对应的 style 关键词，逗号分隔，例如：
   cute chibi anime, healing style, soft lighting, pastel colors, kawaii illustration
 """
-            text = call_gemini_text([prompt, img])
+            text = call_zhipu([prompt, img])
             if text:
                 st.markdown(text)
                 add_history(
@@ -223,7 +341,7 @@ with tab1:
                     text,
                 )
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # --- 镜头与景别 ---
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
@@ -254,7 +372,7 @@ with tab1:
 - 光线类型（直射光、散射光、逆光、轮廓光）
 - 氛围（温暖、冷峻、梦幻、压抑等）
 """
-            text = call_gemini_text([prompt, img])
+            text = call_zhipu([prompt, img])
             if text:
                 st.markdown(text)
                 add_history(
@@ -264,7 +382,7 @@ with tab1:
                     text,
                 )
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # --- 完整 Prompt ---
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
@@ -291,7 +409,7 @@ with tab1:
 如果方便，请给一行英文 negative prompt，例如：
 text, logo, watermark, subtitle, low resolution, blurry, distorted hands, extra limbs, deformed body
 """
-            text = call_gemini_text([prompt, img])
+            text = call_zhipu([prompt, img])
             if text:
                 st.markdown(text)
                 add_history(
@@ -301,13 +419,12 @@ text, logo, watermark, subtitle, low resolution, blurry, distorted hands, extra 
                     text,
                 )
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ========================
 # Tab2：剧本拆镜头
 # ========================
-
 with tab2:
     st.subheader("📚 剧本拆分镜头（主镜头 + 补充镜头 + 视频生成指令）")
 
@@ -315,8 +432,8 @@ with tab2:
         """
 **痛点解决：** 普通工具“一段话只出一张图”，剧情和情绪无法完整表达。  
 这里会自动拆解成：
-- 主镜头（Main Keyframe）  
-- 多个补充镜头（Supplementary Shots：特写 / 中景 / 全景 / 环境空镜）  
+- 主镜头（Main Keyframe）
+- 多个补充镜头（Supplementary Shots：特写 / 中景 / 全景 / 环境空镜）
 - 一段「视频生成指令」描述镜头顺序和节奏。
         """
     )
@@ -375,7 +492,7 @@ with tab2:
 
 只输出 Markdown，不要任何额外解释。
 """
-            text = call_gemini_text(prompt)
+            text = call_zhipu(prompt)
             if text:
                 st.markdown("---")
                 st.markdown("### 📖 拆分结果")
@@ -391,15 +508,15 @@ with tab2:
 # ========================
 # Tab3：角色设定集
 # ========================
-
 with tab3:
     st.subheader("👤 角色设定集（多风格三视图提示词）")
 
     st.markdown(
         """
 **痛点解决：** AI 视频里人物长相经常变化，无法做连续剧情。  
-这里不炼模型，只生成<b>提示词版“角色设定集”</b>，帮助你在不同场景中保持同一个角色。
-        """
+这里不炼模型，只生成 **提示词版“角色设定集”**，帮助你在不同场景中保持同一个角色。
+        """,
+        unsafe_allow_html=True,
     )
 
     col_role_img, col_role_ctrl = st.columns([1, 1.4])
@@ -444,35 +561,33 @@ with tab3:
 【输出格式（Markdown，全中文描述 + 英文 prompt 混排）】
 
 ### 1. 角色基础设定（Character Bible）
-- 角色中文名（可以虚构）：  
-- 年龄、性别、性格关键词：  
-- 外貌概括：脸型、五官特点、发型发色，是否有标志性特征（例如：红色发带、眼下泪痣等）；  
-- 身形（高矮胖瘦）、气质（温柔、冷酷、元气、成熟等）；  
-- 主打风格设定（结合“{main_style}”），例如：古风侠客 / 都市白领等。
+- 角色中文名（可以虚构）：
+- 年龄、性别、性格关键词：
+- 外貌概括：脸型、五官特点、发型发色，是否有标志性特征（例如：红色发带、眼下泪痣等）；
+- 身形（高矮胖瘦）、气质（温柔、冷酷、元气、成熟等）；
+- 主打风格设定（结合“{main_style}”）。
 
 ### 2. 脸部三视图（Face Views）提示词
 请用中英结合的方式，给出三个视角的提示词，每个 1～2 句：
-- 正脸（Front view）：中文简述 + 对应英文提示句  
-- 侧脸（Side view）：中文简述 + 英文  
-- 背面或远景（Back / Distant view）：中文简述 + 英文  
+- 正脸（Front view）：中文简述 + 对应英文提示句
+- 侧脸（Side view）：中文简述 + 英文
+- 背面或远景（Back / Distant view）：中文简述 + 英文
 
 ### 3. 8 种风格的人物全景三视图 Prompt（不换脸，只换穿搭和氛围）
 围绕同一张脸，设计 8 种不同服装/氛围的全身三视图 Prompt。
 每种风格用小标题列出，格式示例：
 
 #### 风格A：古风侠客
-- 中文：用 2～3 句中文描述这个角色在“古风侠客”设定下的全身造型（服装、武器、姿态、场景），注意脸还是同一个人。  
+- 中文：用 2～3 句中文描述这个角色在“古风侠客”设定下的全身造型（服装、武器、姿态、场景），注意脸还是同一个人。
 - 英文 Prompt：对应的一段英文提示词，可以直接给图生图/视频模型使用（包括 front / side / back 全身视角的说明）。
 
-#### 风格B：都市白领
-（同上结构）
-
+#### 风格B：都市白领（同上结构）
 ……
 风格列表请至少包含：古风、都市白领、修仙风格、校园校服、赛博朋克、机甲科幻、运动活力、可爱治愈这 8 类。
 
 所有输出都用 Markdown 格式排版，方便复制。
 """
-            text = call_gemini_text([prompt, role_img])
+            text = call_zhipu([prompt, role_img])
             if text:
                 st.markdown("---")
                 st.markdown("### 📚 角色设定集（可复制保存）")
@@ -488,7 +603,6 @@ with tab3:
 # ========================
 # Tab4：历史记录
 # ========================
-
 with tab4:
     st.subheader("📂 历史记录（本次会话自动保存）")
 
@@ -523,7 +637,6 @@ with tab4:
 
             with st.expander("展开查看内容", expanded=False):
                 st.markdown(item["content"])
-                # 下载按钮
                 fname = f"history_{item['id']}_{item['type']}.md"
                 st.download_button(
                     label="⬇️ 下载此记录（Markdown 文件）",
