@@ -7,14 +7,13 @@ from typing import Any, Dict, List, Optional, Union
 import streamlit as st
 from PIL import Image
 
-# zai-sdk
-from zai import ZaiClient, ZhipuAiClient
+from zhipuai import ZhipuAI
 
 
 # ========================
 # 基本配置
 # ========================
-APP_TITLE = "TapNow · 图生文 / 剧本拆镜头 / 角色设定集 + 历史记录（ZHIPU ONLINE v1.2）"
+APP_TITLE = "TapNow · 图生文 / 剧本拆镜头 / 角色设定集 + 历史记录（ZHIPU ONLINE v1.3）"
 DEFAULT_TEXT_MODEL = "glm-4"
 DEFAULT_VISION_MODEL = "glm-4v"
 
@@ -67,28 +66,12 @@ if "client" not in st.session_state:
 st.markdown(
     """
     <style>
-    .stApp {
-        background-color: #f5f5f5;
-        color: #111827;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    .block-card {
-        background-color: #ffffff;
-        border-radius: 12px;
-        padding: 16px 20px;
-        margin-bottom: 16px;
-        border: 1px solid #e5e7eb;
-    }
-    .block-title {
-        font-size: 1rem;
-        font-weight: 600;
-        margin-bottom: 8px;
-    }
-    .mini-muted {
-        color: #6b7280;
-        font-size: 0.88rem;
-        line-height: 1.45;
-    }
+    .stApp { background-color: #f5f5f5; color: #111827;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .block-card { background-color: #ffffff; border-radius: 12px; padding: 16px 20px;
+        margin-bottom: 16px; border: 1px solid #e5e7eb; }
+    .block-title { font-size: 1rem; font-weight: 600; margin-bottom: 8px; }
+    .mini-muted { color: #6b7280; font-size: 0.88rem; line-height: 1.45; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -104,7 +87,7 @@ st.markdown(
         color: #f9fafb;">
       <h1 style="margin: 0 0 6px 0; font-size: 1.6rem;">🎬 {APP_TITLE}</h1>
       <p style="margin: 0; font-size: 0.96rem;">
-        服务端调用智谱接口（可选域名），图生文 / 拆镜头 / 角色设定集，并自动保存历史。
+        服务端调用智谱接口（可选 base_url），图生文 / 拆镜头 / 角色设定集，并自动保存历史。
       </p>
     </div>
     """,
@@ -130,7 +113,7 @@ if last_call:
 
 
 # ========================
-# 工具：图片转 base64
+# 工具：图片转 data-url base64
 # ========================
 def pil_to_jpeg_bytes(img: Image.Image, quality: int = 92) -> bytes:
     buf = io.BytesIO()
@@ -138,26 +121,14 @@ def pil_to_jpeg_bytes(img: Image.Image, quality: int = 92) -> bytes:
     return buf.getvalue()
 
 
-def pil_to_base64(img: Image.Image) -> str:
-    return base64.b64encode(pil_to_jpeg_bytes(img)).decode("utf-8")
-
-
 def build_image_url_payload(img: Image.Image) -> str:
-    """
-    image_url.url 的内容：
-    - data-url：data:image/jpeg;base64,xxxx（推荐）
-    - raw-base64：xxxx（少数网关/实现可用）
-    """
-    b64 = pil_to_base64(img)
+    b64 = base64.b64encode(pil_to_jpeg_bytes(img)).decode("utf-8")
     mode = st.session_state.get("image_payload_mode", "data-url")
     if mode == "raw-base64":
         return b64
     return f"data:image/jpeg;base64,{b64}"
 
 
-# ========================
-# 调试打印
-# ========================
 def dbg_print(msg: str):
     if st.session_state.get("debug_print", True):
         print(msg, flush=True)
@@ -173,18 +144,14 @@ def record_last_call(model: str, mode: str):
 
 
 # ========================
-# Client 初始化（按 base_url 选择不同 client）
+# Client 初始化（缓存）
 # ========================
-def get_or_init_client(api_key: str, base_url: str):
+def get_or_init_client(api_key: str, base_url: str) -> ZhipuAI:
     conf = {"api_key": api_key, "base_url": base_url}
     if st.session_state.get("client") is not None and st.session_state.get("client_conf") == conf:
         return st.session_state["client"]
 
-    if "open.bigmodel.cn" in base_url:
-        client = ZhipuAiClient(api_key=api_key, base_url=base_url)
-    else:
-        client = ZaiClient(api_key=api_key, base_url=base_url)
-
+    client = ZhipuAI(api_key=api_key, base_url=base_url)
     st.session_state["client"] = client
     st.session_state["client_conf"] = conf
     return client
@@ -194,19 +161,18 @@ def get_or_init_client(api_key: str, base_url: str):
 # 侧边栏
 # ========================
 with st.sidebar:
-    st.header("🔑 智谱 / Z.ai API Key")
+    st.header("🔑 智谱 API Key")
 
     api_key = st.text_input(
         "输入 API Key（或设置环境变量 ZHIPUAI_API_KEY）",
         type="password",
         value=st.session_state["api_key"],
     )
-    # 关键：去空格/去换行，避免 illegal header value
     api_key = (api_key or "").strip().replace("\r", "").replace("\n", "")
     st.session_state["api_key"] = api_key
 
     st.divider()
-    st.subheader("🌐 调用域名（base_url）")
+    st.subheader("🌐 base_url（可选）")
 
     base_url = st.selectbox(
         "base_url",
@@ -236,7 +202,6 @@ with st.sidebar:
         "图片传输方式（image_url.url）",
         ["data-url", "raw-base64"],
         index=0 if st.session_state["image_payload_mode"] == "data-url" else 1,
-        help="推荐 data-url；如果你的网关只接受裸 base64，再选 raw-base64。",
     )
 
     st.session_state["debug_print"] = st.checkbox(
@@ -280,7 +245,7 @@ with st.sidebar:
 
 
 # ========================
-# 调用封装：文本 / 图文
+# 调用封装：文本/图文
 # ========================
 def call_llm(prompt_or_parts: Union[str, List[Any]], image: Optional[Image.Image] = None) -> Optional[str]:
     api_key_local = st.session_state.get("api_key", "")
@@ -356,14 +321,7 @@ def add_history(item_type: str, title: str, input_data: Any, content: str):
     item_id = len(history) + 1
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     history.append(
-        {
-            "id": item_id,
-            "type": item_type,
-            "title": title,
-            "timestamp": ts,
-            "input": input_data,
-            "content": content,
-        }
+        {"id": item_id, "type": item_type, "title": title, "timestamp": ts, "input": input_data, "content": content}
     )
     st.session_state["history"] = history
 
@@ -371,9 +329,8 @@ def add_history(item_type: str, title: str, input_data: Any, content: str):
 # ========================
 # Tabs
 # ========================
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🖼 图生文（图片反推）", "📚 剧本拆分镜头", "👤 角色设定集", "📂 历史记录"]
-)
+tab1, tab2, tab3, tab4 = st.tabs(["🖼 图生文（图片反推）", "📚 剧本拆分镜头", "👤 角色设定集", "📂 历史记录"])
+
 
 # ========================
 # Tab1：图生文
@@ -406,7 +363,6 @@ with tab1:
         shot_btn = st.button("🎥 分析镜头与景别 (Shot & Composition)")
         prompt_btn = st.button("🧠 生成完整提示词 (Prompt)")
 
-    # Style
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
     st.markdown('<div class="block-title">🎨 风格提示词 (Style)</div>', unsafe_allow_html=True)
     if style_btn:
@@ -422,15 +378,9 @@ with tab1:
             text = call_llm([prompt, img])
             if text:
                 st.markdown(text)
-                add_history(
-                    "image_style",
-                    f"风格提示词 - {uploaded_image.name if uploaded_image else ''}",
-                    {"filename": uploaded_image.name if uploaded_image else ""},
-                    text,
-                )
+                add_history("image_style", f"风格提示词 - {uploaded_image.name}", {"filename": uploaded_image.name}, text)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Shot
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
     st.markdown('<div class="block-title">🎥 镜头与景别 (Shot & Composition)</div>', unsafe_allow_html=True)
     if shot_btn:
@@ -447,15 +397,9 @@ with tab1:
             text = call_llm([prompt, img])
             if text:
                 st.markdown(text)
-                add_history(
-                    "image_shot",
-                    f"镜头与景别 - {uploaded_image.name if uploaded_image else ''}",
-                    {"filename": uploaded_image.name if uploaded_image else ""},
-                    text,
-                )
+                add_history("image_shot", f"镜头与景别 - {uploaded_image.name}", {"filename": uploaded_image.name}, text)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Prompt
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
     st.markdown('<div class="block-title">🧠 完整提示词 (Prompt)</div>', unsafe_allow_html=True)
     if prompt_btn:
@@ -471,12 +415,7 @@ with tab1:
             text = call_llm([prompt, img])
             if text:
                 st.markdown(text)
-                add_history(
-                    "image_prompt",
-                    f"完整提示词 - {uploaded_image.name if uploaded_image else ''}",
-                    {"filename": uploaded_image.name if uploaded_image else ""},
-                    text,
-                )
+                add_history("image_prompt", f"完整提示词 - {uploaded_image.name}", {"filename": uploaded_image.name}, text)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -485,13 +424,6 @@ with tab1:
 # ========================
 with tab2:
     st.subheader("📚 剧本拆分镜头（主镜头 + 补充镜头 + 视频生成指令）")
-
-    st.markdown(
-        """
-**痛点解决：** 普通工具“一段话只出一张图”，剧情与情绪无法完整表达。  
-这里会输出：主镜头（Main Keyframe）+ 多个补充镜头 + 视频生成指令（8～15秒）。
-        """
-    )
 
     script_text = st.text_area(
         "粘贴一小段剧情 / 文案（建议只描述一个场景）：",
@@ -523,26 +455,14 @@ with tab2:
                 st.markdown("---")
                 st.markdown("### 📖 拆分结果")
                 st.markdown(text)
-                add_history(
-                    "script_scene",
-                    "剧本拆分镜头",
-                    {"script": script_text, "max_shots": max_shots},
-                    text,
-                )
+                add_history("script_scene", "剧本拆分镜头", {"script": script_text, "max_shots": max_shots}, text)
 
 
 # ========================
-# Tab3：角色设定集（已修复断行）
+# Tab3：角色设定集
 # ========================
 with tab3:
     st.subheader("👤 角色设定集（多风格三视图提示词）")
-
-    st.markdown(
-        """
-**痛点解决：** AI 视频里人物长相经常变化。  
-这里生成“文字版角色设定集”（不训练 LoRA），帮助你保持人物一致性。
-        """
-    )
 
     col_role_img, col_role_ctrl = st.columns([1, 1.4])
 
@@ -559,16 +479,7 @@ with tab3:
             role_img = None
 
     with col_role_ctrl:
-        style_options = [
-            "古风侠客",
-            "都市白领",
-            "修仙风格",
-            "校园校服",
-            "赛博朋克",
-            "机甲科幻",
-            "运动活力",
-            "可爱治愈",
-        ]
+        style_options = ["古风侠客", "都市白领", "修仙风格", "校园校服", "赛博朋克", "机甲科幻", "运动活力", "可爱治愈"]
         main_style = st.selectbox("选择主打风格：", style_options)
         role_btn = st.button("👤 生成角色设定集提示词")
 
@@ -584,20 +495,8 @@ with tab3:
 
 【输出格式（Markdown）】
 ### 1. 角色基础设定（Character Bible）
-- 角色中文名（可虚构）
-- 年龄、性别、性格关键词
-- 外貌概括（脸型/五官/发型发色/标志特征）
-- 身形与气质
-- 主打风格设定（结合 {main_style}）
-
-### 2. 脸部三视图（Face Views）提示词（中英结合）
-- 正脸（Front）：中文简述 + 英文一句
-- 侧脸（Side）：中文简述 + 英文一句
-- 背面或远景（Back / Distant）：中文简述 + 英文一句
-
-### 3. 8 种风格的全景三视图 Prompt（不换脸，只换穿搭与氛围）
-至少包含：古风、白领、修仙、校服、赛博、机甲、运动、治愈
-每种：中文 2～3 句 + 英文 Prompt（包含 front/side/back 全身视角说明）
+### 2. 脸部三视图（Face Views）提示词（中英结合：正脸/侧脸/背面或远景）
+### 3. 8 种风格的全景三视图 Prompt（不换脸，只换穿搭与氛围：古风/白领/修仙/校服/赛博/机甲/运动/治愈）
 """
             text = call_llm([prompt, role_img])
             if text:
@@ -606,8 +505,8 @@ with tab3:
                 st.markdown(text)
                 add_history(
                     "role_design",
-                    f"角色设定集 - {role_image.name if role_image else ''}",
-                    {"filename": role_image.name if role_image else "", "main_style": main_style},
+                    f"角色设定集 - {role_image.name}",
+                    {"filename": role_image.name, "main_style": main_style},
                     text,
                 )
 
@@ -630,20 +529,14 @@ with tab4:
             "script_scene": "剧本拆镜头",
             "role_design": "角色设定集",
         }
-        type_select = st.selectbox(
-            "按类型筛选：",
-            options=list(type_map.keys()),
-            format_func=lambda k: type_map[k],
-        )
+        type_select = st.selectbox("按类型筛选：", options=list(type_map.keys()), format_func=lambda k: type_map[k])
 
         for item in reversed(history):
             if type_select != "all" and item["type"] != type_select:
                 continue
 
             tag = type_map.get(item["type"], item["type"])
-            st.markdown(
-                f"#### 🧾 [{tag}] {item['title']}  \n`#{item['id']}` · {item['timestamp']}"
-            )
+            st.markdown(f"#### 🧾 [{tag}] {item['title']}  \n`#{item['id']}` · {item['timestamp']}")
 
             with st.expander("展开查看内容", expanded=False):
                 st.markdown(item["content"])
